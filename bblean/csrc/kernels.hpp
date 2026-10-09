@@ -1,11 +1,21 @@
 // Kernels of the similarity calculations (similarity.cpp): popcounts, Tanimoto
-// similarity, iSIM and majority centroids
+// similarity, iSIM, majority centroids and the most dissimilar pair of a set of
+// fingerprints
+//
+// Fingerprints are rows of 64 bit words: a packed (uint8) fingerprint viewed as
+// 64 bit words, zero padded to a whole number of words. The order of the bits
+// within the words does not matter for these calculations.
 #pragma once
 
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
-#include <type_traits>
+#include <vector>
+
+#if defined(__ARM_NEON) && defined(__aarch64__)
+#define BBLEAN_NEON 1
+#include <arm_neon.h>
+#endif
 
 // Scalar popcount intrinsics:
 #if defined(__SSE_4_2__) || defined(_M_SSE4_2)
@@ -38,28 +48,98 @@
 
 namespace bblean {
 
-// Tanimoto similarities of n_samples rows of steps words to vec (T must be
-// uint64_t or uint8_t), given the popcounts of the rows (cardinalities) and of
-// vec. The similarity of two empty fingerprints is 0.
-template <typename T>
-inline void jt_sims(const T* arr, const T* vec, size_t n_samples, size_t steps, uint32_t vec_popcount,
-                    const uint32_t* cardinalities, double* out) {
-    for (size_t i{0}; i != n_samples; ++i) {  // not auto-vec by GCC
-        const T* arr_row = arr + i * steps;
-        uint32_t intersection{0};
-        for (size_t j{0}; j != steps; ++j) {  // not auto-vec by GCC
-            if constexpr (std::is_same_v<T, uint64_t>) {
-                intersection += POPCOUNT_64(arr_row[j] & vec[j]);
-            } else {
-                intersection += POPCOUNT_32(arr_row[j] & vec[j]);
-            }
+using u64 = uint64_t;
+
+inline uint32_t popcount(const u64* a, size_t w64) {
+    uint32_t s = 0;
+    for (size_t k = 0; k < w64; ++k) s += static_cast<uint32_t>(POPCOUNT_64(a[k]));
+    return s;
+}
+
+#if defined(_MSC_VER) && !defined(__clang__)
+}  // namespace bblean
+#include <intrin.h>
+namespace bblean {
+inline int ctz64(u64 x) {
+    unsigned long i;
+    _BitScanForward64(&i, x);
+    return static_cast<int>(i);
+}
+#else
+inline int ctz64(u64 x) { return __builtin_ctzll(x); }
+#endif
+
+// Calls f(p) for every set bit p of a row
+template <typename F>
+inline void for_each_bit(const u64* a, size_t w64, F&& f) {
+    for (size_t k = 0; k < w64; ++k)
+        for (u64 w = a[k]; w; w &= w - 1) f(static_cast<int>(k * 64) + ctz64(w));
+}
+
+#if defined(BBLEAN_NEON)
+// Query of V 16-byte vectors held in registers. Byte counts accumulate in u8
+// lanes, at most 8 * V / 2 <= 128 per lane for V <= 32.
+template <int V>
+struct NeonQuery {
+    uint8x16_t v[V];
+    explicit NeonQuery(const u64* q) {
+        const auto* p = reinterpret_cast<const uint8_t*>(q);
+        for (int k = 0; k < V; ++k) v[k] = vld1q_u8(p + 16 * k);
+    }
+    uint32_t and_popcount(const u64* a) const {
+        const auto* p = reinterpret_cast<const uint8_t*>(a);
+        uint8x16_t acc0 = vcntq_u8(vandq_u8(vld1q_u8(p), v[0]));
+        uint8x16_t acc1 = vcntq_u8(vandq_u8(vld1q_u8(p + 16), v[1]));
+        for (int k = 2; k < V; k += 2) {
+            acc0 = vaddq_u8(acc0, vcntq_u8(vandq_u8(vld1q_u8(p + 16 * k), v[k])));
+            acc1 = vaddq_u8(acc1, vcntq_u8(vandq_u8(vld1q_u8(p + 16 * k + 16), v[k + 1])));
         }
-        auto denominator = cardinalities[i] + vec_popcount - intersection;
-        // Cast is technically unnecessary since std::max promotes to double,
-        // but added here for clarity (should compile to nop)
-        out[i] = intersection / std::max(static_cast<double>(denominator), 1.0);
+        return vaddlvq_u8(vaddq_u8(acc0, acc1));
+    }
+};
+#endif
+
+// Calls f(i, popcount(row_i & query)) for each of the n rows (rows of w64 words)
+template <typename F>
+inline void for_each_intersection(const u64* rows, size_t n, size_t w64, const u64* query, F&& f) {
+#if defined(BBLEAN_NEON)
+    // 2048 and 1024 bit fingerprints: the query is kept in registers
+    if (w64 == 32 || w64 == 16) {
+        auto scan = [&](const auto& q) {
+            for (size_t i = 0; i < n; ++i) f(i, q.and_popcount(rows + i * w64));
+        };
+        if (w64 == 32) {
+            scan(NeonQuery<16>(query));
+        } else {
+            scan(NeonQuery<8>(query));
+        }
+        return;
+    }
+#endif
+    for (size_t i = 0; i < n; ++i) {
+        const u64* r = rows + i * w64;
+        uint32_t s = 0;
+        for (size_t k = 0; k < w64; ++k) s += static_cast<uint32_t>(POPCOUNT_64(r[k] & query[k]));
+        f(i, s);
     }
 }
+
+// Tanimoto similarity from the popcounts of a & b, a and b. The similarity of two
+// empty fingerprints is 0.
+inline double jt_sim(uint32_t intersection, uint32_t pop_a, uint32_t pop_b) {
+    const uint32_t denominator = pop_a + pop_b - intersection;
+    return intersection / std::max(static_cast<double>(denominator), 1.0);
+}
+
+// Tanimoto similarities of n rows (with popcounts pops) to query
+inline void jt_sims(const u64* rows, const uint32_t* pops, size_t n, size_t w64, const u64* query, double* out) {
+    const uint32_t query_pop = popcount(query, w64);
+    for_each_intersection(rows, n, w64, query,
+                          [&](size_t i, uint32_t inter) { out[i] = jt_sim(inter, pops[i], query_pop); });
+}
+
+// Index of the first minimum of n values
+inline size_t first_min(const double* v, size_t n) { return static_cast<size_t>(std::min_element(v, v + n) - v); }
 
 // iSIM Tanimoto of n_objects fingerprints, from sum_kq and sum_kqsq, the sum and
 // the sum of squares of their column-wise sum (n_objects must be >= 2)
@@ -81,6 +161,35 @@ inline uint8_t centroid_value(T linear_sum, int64_t n_samples) {
         return static_cast<uint8_t>(linear_sum);
     }
     return (linear_sum >= n_samples * 0.5) ? 1 : 0;
+}
+
+template <typename T>
+inline bool centroid_bit(T linear_sum, int64_t n_samples) {
+    return centroid_value(linear_sum, n_samples) != 0;
+}
+
+// Most dissimilar pair of n rows (O(N) approximation): fp1 is the first row least
+// similar to the centroid of the rows, fp2 the first row least similar to fp1.
+// The centroid uses the first n_columns bits only (the first n_columns / 8 bytes
+// of the packed fingerprints). Writes the similarities of
+// all rows to fp1 and fp2.
+struct DissimilarPair {
+    size_t fp1, fp2;
+};
+
+inline DissimilarPair most_dissimilar(const u64* rows, const uint32_t* pops, size_t n, size_t w64, size_t n_columns,
+                                      double* sims1, double* sims2) {
+    std::vector<u64> counts(w64 * 64, 0);
+    for (size_t i = 0; i < n; ++i) for_each_bit(rows + i * w64, w64, [&](int p) { ++counts[p]; });
+    std::vector<u64> centroid(w64, 0);
+    for (size_t p = 0; p < n_columns; ++p)
+        if (centroid_bit(counts[p], static_cast<int64_t>(n))) centroid[p >> 6] |= u64{1} << (p & 63);
+    jt_sims(rows, pops, n, w64, centroid.data(), sims1);
+    const size_t fp1 = first_min(sims1, n);
+    jt_sims(rows, pops, n, w64, rows + fp1 * w64, sims1);
+    const size_t fp2 = first_min(sims1, n);
+    jt_sims(rows, pops, n, w64, rows + fp2 * w64, sims2);
+    return {fp1, fp2};
 }
 
 }  // namespace bblean
