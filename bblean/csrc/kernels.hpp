@@ -1,6 +1,7 @@
-// Kernels of the similarity calculations (similarity.cpp): popcounts, Tanimoto
-// similarity, iSIM, majority centroids and the most dissimilar pair of a set of
-// fingerprints
+// Kernels shared by the similarity calculations (similarity.cpp) and the
+// BitBirch tree (bitbirch.cpp): popcounts, Tanimoto similarity, iSIM, majority
+// centroids, the most dissimilar pair of a set of fingerprints, and the merge
+// criteria
 //
 // Fingerprints are rows of 64 bit words: a packed (uint8) fingerprint viewed as
 // 64 bit words, zero padded to a whole number of words. The order of the bits
@@ -8,6 +9,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -138,8 +140,9 @@ inline void jt_sims(const u64* rows, const uint32_t* pops, size_t n, size_t w64,
                           [&](size_t i, uint32_t inter) { out[i] = jt_sim(inter, pops[i], query_pop); });
 }
 
-// Index of the first minimum of n values
+// Index of the first minimum / maximum of n values
 inline size_t first_min(const double* v, size_t n) { return static_cast<size_t>(std::min_element(v, v + n) - v); }
+inline size_t first_max(const double* v, size_t n) { return static_cast<size_t>(std::max_element(v, v + n) - v); }
 
 // iSIM Tanimoto of n_objects fingerprints, from sum_kq and sum_kqsq, the sum and
 // the sum of squares of their column-wise sum (n_objects must be >= 2)
@@ -168,6 +171,29 @@ inline bool centroid_bit(T linear_sum, int64_t n_samples) {
     return centroid_value(linear_sum, n_samples) != 0;
 }
 
+// Sum and sum of squares of the column sums L (count columns) of n objects;
+// on_centroid(j, L_j) is called for each column j in their majority centroid
+template <typename T, typename F>
+inline void column_sums(const T* L, size_t count, u64 n, u64& sum, u64& sum_sq, F&& on_centroid) {
+    sum = sum_sq = 0;
+    for (size_t j = 0; j < count; ++j) {
+        const u64 v = static_cast<u64>(L[j]);
+        sum += v;
+        sum_sq += v * v;
+        if (centroid_bit(v, static_cast<int64_t>(n))) on_centroid(j, v);
+    }
+}
+
+// Complement of the iSIM radius of n objects (n >= 2) with column sums L, given
+// sum, sum_sq, the popcount c_pop of the centroid c and S = sum_{j in c} L_j.
+// Adding the centroid to the objects gives sums sum + c_pop and sum_sq + 2 S +
+// c_pop.
+inline double radius_compl(u64 sum, u64 sum_sq, u64 n, u64 c_pop, u64 S) {
+    const double jt = isim(sum, sum_sq, static_cast<int64_t>(n));
+    const double jt1 = isim(sum + c_pop, sum_sq + 2 * S + c_pop, static_cast<int64_t>(n + 1));
+    return (jt1 * static_cast<double>(n + 1) - jt * static_cast<double>(n - 1)) / 2;
+}
+
 // Most dissimilar pair of n rows (O(N) approximation): fp1 is the first row least
 // similar to the centroid of the rows, fp2 the first row least similar to fp1.
 // The centroid uses the first n_columns bits only (the first n_columns / 8 bytes
@@ -190,6 +216,76 @@ inline DissimilarPair most_dissimilar(const u64* rows, const uint32_t* pops, siz
     const size_t fp2 = first_min(sims1, n);
     jt_sims(rows, pops, n, w64, rows + fp2 * w64, sims2);
     return {fp1, fp2};
+}
+
+// ------------------------------------------------------------ merge criteria
+
+enum MergeKind : int {
+    kDiameter = 0,
+    kRadius = 1,
+    kToleranceDiameter = 2,
+    kFlexibleToleranceDiameter = 3,
+    kToleranceRadius = 4,
+    kToleranceLegacy = 5,
+    kNever = 6,
+};
+
+struct MergeCriterion {
+    int kind = kDiameter;
+    double threshold = 0.65;
+    double tolerance = 0.05;
+    double decay = 0.0;  // size dependent tolerance (tolerance-* except legacy)
+    double offset = 0.0;
+
+    double tolerance_for(u64 old_n) const {
+        const double t = tolerance * (std::exp(-decay * static_cast<double>(old_n)) - offset);
+        return (0.0 > t) ? 0.0 : t;
+    }
+};
+
+// Sizes and sums of the old cluster, the nominee and the merged cluster. The
+// radius complements are only computed when the criterion needs them
+// (new_rc() of the merged cluster, old_rc() of the old one).
+struct MergeSums {
+    u64 old_n, nom_n, new_n;
+    u64 old_sum, old_sum_sq, new_sum, new_sum_sq;
+};
+
+template <typename NewRc, typename OldRc>
+inline bool accept_merge(const MergeCriterion& c, const MergeSums& s, NewRc&& new_rc, OldRc&& old_rc) {
+    const double thr = c.threshold;
+    switch (c.kind) {
+        case kDiameter:
+            return isim(s.new_sum, s.new_sum_sq, static_cast<int64_t>(s.new_n)) >= thr;
+        case kRadius:
+            return new_rc() >= thr;
+        case kToleranceDiameter:
+        case kFlexibleToleranceDiameter: {
+            const double new_dc = isim(s.new_sum, s.new_sum_sq, static_cast<int64_t>(s.new_n));
+            if (new_dc < thr) return false;
+            if (s.old_n == 1) return true;
+            const double old_dc = isim(s.old_sum, s.old_sum_sq, static_cast<int64_t>(s.old_n));
+            double ref = old_dc;
+            if (c.kind == kFlexibleToleranceDiameter && thr < old_dc) ref = thr;  // min(old_dc, thr)
+            return new_dc >= ref - c.tolerance_for(s.old_n);
+        }
+        case kToleranceRadius: {
+            const double new_rc_v = new_rc();
+            if (new_rc_v < thr) return false;
+            if (s.old_n == 1) return true;
+            return new_rc_v >= old_rc() - c.tolerance_for(s.old_n);
+        }
+        case kToleranceLegacy: {
+            const double new_dc = isim(s.new_sum, s.new_sum_sq, static_cast<int64_t>(s.new_n));
+            if (new_dc < thr) return false;
+            if (s.old_n == 1 || s.nom_n != 1) return true;
+            const double old_dc = isim(s.old_sum, s.old_sum_sq, static_cast<int64_t>(s.old_n));
+            return (new_dc * static_cast<double>(s.new_n) - old_dc * static_cast<double>(s.old_n - 1)) / 2 >=
+                   old_dc - c.tolerance;
+        }
+        default:
+            return false;
+    }
 }
 
 }  // namespace bblean

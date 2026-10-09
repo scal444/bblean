@@ -28,8 +28,6 @@ if os.getenv("BITBIRCH_BUILD_CPP"):
     import pybind11
     from pybind11.setup_helpers import Pybind11Extension, WIN
 
-    # setuptools paths must be relative
-    ext_sources = [str((Path(name) / "csrc" / "similarity.cpp"))]
     if not WIN:
         extra_compile_args.append("-O3")  # -O3 includes -ftree-vectorize
     if not WIN:
@@ -54,15 +52,24 @@ if os.getenv("BITBIRCH_BUILD_CPP"):
     if os.getenv("BITBIRCH_DEBUG_EXT"):
         extra_compile_args.append("-fopt-info-vec-all")  # print loop vectorization info
         extra_compile_args.append("-DDEBUG_LOGS=1")
+    # The BitBirch tree must give the same results as the python tree, so
+    # multiply-adds must not be fused (GCC fuses by default on aarch64)
+    if not WIN:
+        extra_compile_args.append("-ffp-contract=off")
     _setup_kwargs["ext_modules"] = [
         Pybind11Extension(
-            ".".join((name, "_cpp_similarity")),
-            ext_sources,
+            ".".join((name, module)),
+            [str((Path(name) / "csrc" / source))],
             include_dirs=[pybind11.get_include()],
             language="c++",
             cxx_std=17,
             extra_compile_args=extra_compile_args,
-        ),
+            depends=[str((Path(name) / "csrc" / "kernels.hpp"))],
+        )
+        for module, source in [
+            ("_cpp_similarity", "similarity.cpp"),
+            ("_cpp_bitbirch", "bitbirch.cpp"),
+        ]
     ]
 
 setuptools.setup(**_setup_kwargs)
