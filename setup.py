@@ -53,8 +53,12 @@ if os.getenv("BITBIRCH_BUILD_CPP"):
     # The BitBirch tree must give the same results as the python tree, so
     # multiply-adds must not be fused (GCC fuses them by default when the target
     # has FMA instructions, e.g. on aarch64 or with -march=native)
+    extra_link_args = []
     if not WIN:
         extra_compile_args.append("-ffp-contract=off")
+        # The batched BitBirch fit uses std::thread
+        extra_compile_args.append("-pthread")
+        extra_link_args.append("-pthread")
     _setup_kwargs["ext_modules"] = [
         Pybind11Extension(
             ".".join((name, module)),
@@ -64,7 +68,11 @@ if os.getenv("BITBIRCH_BUILD_CPP"):
             language="c++",
             cxx_std=17,
             extra_compile_args=extra_compile_args,
-            depends=[str((Path(name) / "csrc" / "kernels.hpp"))],
+            extra_link_args=extra_link_args,
+            depends=[
+                str((Path(name) / "csrc" / header))
+                for header in ("kernels.hpp", "bitbirch_batched.hpp")
+            ],
         )
         for module, source in [
             ("_cpp_similarity", "similarity.cpp"),

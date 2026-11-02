@@ -13,6 +13,9 @@
 //   is more similar to (ties to the second one), the first seed to the first.
 // - Centroids are majority votes of the linear sums (kernels.hpp).
 // - Merge criteria: the builtin criteria of bblean.merges (accept_merge).
+// - Batched fits (BitBirch(..., batch_size=...), fit_batched): a different
+//   algorithm, nvMolKit's batched BitBIRCH, multithreaded
+//   (bitbirch_batched.hpp), builds the tree and hands it over to an empty Tree.
 //
 // Storage: each node keeps the centroids of its subclusters contiguously (in
 // order) and their popcounts. Each subcluster ("entry") keeps n_samples, the
@@ -30,6 +33,7 @@
 #include <pybind11/pybind11.h>
 
 #include <algorithm>
+#include <climits>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -241,7 +245,11 @@ struct Nominee {
     int64_t head = -1, tail = -1;
 };
 
+class BatchedFit;  // bitbirch_batched.hpp
+
 class Tree {
+    friend class BatchedFit;
+
    public:
     explicit Tree(int n_features) {
         if (n_features <= 0 || n_features % 8 != 0) {
@@ -395,6 +403,100 @@ class Tree {
             out.append(mem_id_[m]);
         }
         return out;
+    }
+
+    // Consistency of the tree (for tests): every summary is the sum of the
+    // subclusters of its child node, sums / centroids / popcounts match the
+    // linear sums, the leaf chain lists every leaf once, and (if
+    // members_equal_n) every leaf subcluster has n_samples molecules. Returns
+    // "" or the first problem found.
+    std::string check_invariants(bool members_equal_n) const {
+        if (root_ < 0) {
+            return first_leaf_ < 0 ? "" : "internal nodes released";
+        }
+        std::vector<uint64_t> ls(n_bits_), children(n_bits_), tmp(n_bits_);
+        size_t num_leaves = 0;
+        std::vector<int32_t> stack{root_};
+        while (!stack.empty()) {
+            const int32_t nid = stack.back();
+            stack.pop_back();
+            const Node& nd = nodes_[nid];
+            if (nd.ents.empty()) {
+                return "empty node " + std::to_string(nid);
+            }
+            if (static_cast<int>(nd.ents.size()) > nd.bf) {
+                return "overfull node " + std::to_string(nid);
+            }
+            num_leaves += nd.leaf;
+            for (size_t i = 0; i < nd.ents.size(); ++i) {
+                const Entry& entry = ents_[nd.ents[i]];
+                const uint64_t* c = nd.cent.data() + i * w64_;
+                const std::string where = "node " + std::to_string(nid) +
+                                          " entry " + std::to_string(i) + ": ";
+                if ((entry.child >= 0) == nd.leaf) {
+                    return where + "child / leaf mismatch";
+                }
+                dense_sum(entry, c, ls.data());
+                uint64_t sum_kq = 0, sum_kqsq = 0;
+                for (int p = 0; p < n_bits_; ++p) {
+                    sum_kq += ls[p];
+                    sum_kqsq += ls[p] * ls[p];
+                    const bool bit = (c[p >> 6] >> (p & 63)) & 1;
+                    if (centroid_bit(ls[p],
+                                     static_cast<int64_t>(entry.n_samples)) !=
+                        bit) {
+                        return where + "centroid";
+                    }
+                }
+                if (sum_kq != entry.sum_kq || sum_kqsq != entry.sum_kqsq) {
+                    return where + "sum_kq / sum_kqsq";
+                }
+                if (popcount(c, w64_) != nd.pop[i]) {
+                    return where + "popcount";
+                }
+                if (entry.child >= 0) {
+                    const Node& ch = nodes_[entry.child];
+                    std::fill(children.begin(), children.end(), 0);
+                    uint64_t n = 0;
+                    for (size_t j = 0; j < ch.ents.size(); ++j) {
+                        const Entry& sub = ents_[ch.ents[j]];
+                        n += sub.n_samples;
+                        dense_sum(sub, ch.cent.data() + j * w64_, tmp.data());
+                        for (int p = 0; p < n_bits_; ++p) {
+                            children[p] += tmp[p];
+                        }
+                    }
+                    if (n != entry.n_samples || children != ls) {
+                        return where + "summary != sum of children";
+                    }
+                    stack.push_back(entry.child);
+                    continue;
+                }
+                uint64_t count = 0;
+                int64_t last = -1;
+                for (int64_t m = entry.head; m >= 0; m = mem_next_[m]) {
+                    ++count;
+                    last = m;
+                }
+                if (last != entry.tail) {
+                    return where + "member tail";
+                }
+                if (members_equal_n && count != entry.n_samples) {
+                    return where + "members != n_samples";
+                }
+            }
+        }
+        size_t chained = 0;
+        std::vector<char> seen(nodes_.size(), 0);
+        int32_t prev = -1;
+        for (int32_t l = first_leaf_; l >= 0; prev = l, l = nodes_[l].next) {
+            if (!nodes_[l].leaf || seen[l] || nodes_[l].prev != prev) {
+                return "leaf chain";
+            }
+            seen[l] = 1;
+            ++chained;
+        }
+        return chained == num_leaves ? "" : "leaf chain misses leaves";
     }
 
     // ----------------------------------------------------------- pickling
@@ -942,6 +1044,8 @@ Tree Tree::deserialize(const std::string& s) {
 
 }  // namespace bblean
 
+#include "bitbirch_batched.hpp"
+
 // ----------------------------------------------------------------- bindings
 
 namespace {
@@ -1073,6 +1177,73 @@ void fit_buffers(Tree& tree, const py::array& X, const py::object& idx,
     }
 }
 
+// Batched fit (bitbirch_batched.hpp) of packed fingerprints into an empty
+// tree, with the 'diameter' criterion
+void fit_batched(Tree& tree, const py::array_t<uint8_t, py::array::c_style>& X,
+                 const py::object& ids, int64_t start, double threshold, int bf,
+                 int batch_size, int threads) {
+    if (X.ndim() != 2) {
+        throw std::invalid_argument("fingerprints must be a 2D array");
+    }
+    if (X.shape(1) != tree.n_bytes()) {
+        throw std::invalid_argument(
+            "fingerprints have " + std::to_string(X.shape(1)) +
+            " bytes, expected " + std::to_string(tree.n_bytes()));
+    }
+    if (tree.initialized()) {
+        throw std::invalid_argument("a batched fit requires an empty tree");
+    }
+    if (!(threshold >= 0 && threshold <= 1)) {
+        throw std::invalid_argument("threshold must be in [0, 1]");
+    }
+    if (bf < 3) {
+        throw std::invalid_argument(
+            "a batched fit requires branching_factor >= 3");
+    }
+    if (batch_size < 1) {
+        throw std::invalid_argument("batch_size must be >= 1");
+    }
+    const int64_t rows = X.shape(0);
+    if (rows < 1) {
+        throw std::invalid_argument("there must be at least 1 fingerprint");
+    }
+    if (rows > INT_MAX / 2) {
+        throw std::invalid_argument("too many fingerprints for a batched fit");
+    }
+    Int64Array id_arr;
+    const int64_t* id_ptr = nullptr;
+    if (!ids.is_none()) {
+        id_arr = ids.cast<Int64Array>();
+        if (id_arr.ndim() != 1 || id_arr.shape(0) < rows) {
+            throw std::invalid_argument("not enough indices");
+        }
+        id_ptr = id_arr.data();
+    }
+    const int n = static_cast<int>(rows);
+    const int n_bytes = tree.n_bytes();
+    const int w64 = (n_bytes + 7) / 8;
+    const uint8_t* data = X.data();
+    // The GIL is held during the fit (the threads of the pool never use
+    // python), so no other python thread can use the tree while it is built
+    bblean::SpinPool pool(threads);
+    // Rows of 64 bit words; the input is used in place when possible
+    std::vector<uint64_t> copy;
+    const auto* fps = reinterpret_cast<const uint64_t*>(data);
+    if (n_bytes % 8 != 0 ||
+        reinterpret_cast<std::uintptr_t>(data) % alignof(uint64_t) != 0) {
+        copy.resize(static_cast<size_t>(n) * w64);
+        pool.parallel_for(n, 1024, [&](int64_t i, int) {
+            uint64_t* dst = copy.data() + static_cast<size_t>(i) * w64;
+            dst[w64 - 1] = 0;
+            std::memcpy(dst, data + static_cast<size_t>(i) * n_bytes, n_bytes);
+        });
+        fps = copy.data();
+    }
+    bblean::BatchedFit fit(fps, n, w64, threshold, bf, batch_size, pool);
+    fit.run();
+    fit.hand_over(tree, id_ptr, start);
+}
+
 py::list cluster_mol_ids(const Tree& tree, bool sort) {
     const auto order = tree.leaf_entries(sort);
     py::list out(order.size());
@@ -1157,7 +1328,13 @@ PYBIND11_MODULE(_cpp_bitbirch, m) {
              py::arg("branching_factor"))
         .def("fit_buffers", &fit_buffers, py::arg("X"), py::arg("idx"),
              py::arg("offsets"), py::arg("merge"), py::arg("branching_factor"))
+        .def("fit_batched", &fit_batched, py::arg("X"), py::arg("ids"),
+             py::arg("start"), py::arg("threshold"),
+             py::arg("branching_factor"), py::arg("batch_size"),
+             py::arg("threads"))
         .def("release_internal", &Tree::release_internal)
+        .def("_check_invariants", &Tree::check_invariants,
+             py::arg("members_equal_n") = true)
         .def("cluster_mol_ids", &cluster_mol_ids, py::arg("sort") = true)
         .def("leaf_sizes", &leaf_sizes, py::arg("sort") = true)
         .def("assignments", &assignments, py::arg("n_mols"),

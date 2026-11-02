@@ -5,3 +5,6 @@
 - `similarity.cpp`: `bblean._cpp_similarity`, used by `bblean.similarity`.
 - `bitbirch.cpp`: `bblean._cpp_bitbirch`, the BitBirch tree used by `bblean.BitBirch`
   (same results as the python tree), and the builtin merge criteria.
+- `bitbirch_batched.hpp`: the batched multithreaded fit of `bblean.BitBirch(...,
+  batch_size=...)` (the algorithm of nvMolKit's GPU BitBIRCH), included by
+  `bitbirch.cpp`.

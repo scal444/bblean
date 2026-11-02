@@ -71,7 +71,7 @@ from bblean.merges import (
     _BUILTIN_MERGES,
     DiscardSubcluster,
 )
-from bblean.utils import min_safe_uint
+from bblean.utils import min_safe_uint, _num_avail_cpus
 from bblean.fingerprints import (
     pack_fingerprints,
     _get_fingerprints_from_file_seq,
@@ -923,6 +923,44 @@ class _CppTree:
             )
             count(int(offs[-1] - offs[0]), False)
 
+    def fit_batched(
+        self,
+        X: _Input,
+        n_features: int,
+        input_is_packed: bool,
+        reinsert_indices: tp.Iterable[int] | None,
+        params: _FitParams,
+        start: int,
+        batch_size: int,
+        n_threads: int,
+    ) -> int:
+        # Batched fit (nvMolKit's algorithm) of all of X into this (empty) tree,
+        # returns the number of fitted fingerprints
+        packed_rows = _cpp_packed_rows(X, input_is_packed, n_features)
+        if packed_rows is None:
+            raise ValueError(
+                "Batched fits require packed uint8 or binary (0 / 1) unpacked"
+                " fingerprints"
+            )
+        num = len(X)
+        ids = None
+        if reinsert_indices is not None:
+            ids = np.fromiter(
+                itertools.islice(reinsert_indices, num), dtype=np.int64, count=-1
+            )
+            if len(ids) < num:
+                raise ValueError("There are fewer reinsert_indices than fingerprints")
+        self._tree.fit_batched(
+            packed_rows(0, num),
+            ids,
+            start,
+            float(params.threshold),
+            params.branching_factor,
+            batch_size,
+            n_threads,
+        )
+        return num
+
     def release_internal(self) -> None:
         self._tree.release_internal()
 
@@ -997,6 +1035,24 @@ class BitBirch:
     the same clusters. Set the environment variable ``BITBIRCH_NO_CPP_TREE=1`` to
     always use the python tree.
 
+    batch_size: int | None = None
+        If set, ``fit`` uses the multithreaded *batched* algorithm of nvMolKit's GPU
+        BitBIRCH instead of inserting fingerprints one by one: rows are fitted in
+        batches of ``batch_size``, each batch in rounds against a snapshot of the
+        tree. For the same input order, threshold, branching factor and batch size
+        it gives the same clusters as ``nvmolkit.clustering.bitbirch``. This is a
+        different (order dependent) algorithm, so the clusters differ from the
+        serial ones (also for ``batch_size=1``). It requires the C++ tree, the
+        'diameter' merge criterion and ``branching_factor >= 3``; weights are not
+        supported, and a batched ``fit`` must start from an empty tree (call
+        ``reset()`` first). The result is a regular C++ tree: all methods
+        (refinement, reclustering, ``delete_internal_nodes``, pickling, ...) work on
+        it, and further fits after setting ``batch_size = None`` insert serially.
+        Refinement, reclustering and buffer fits always insert serially.
+
+    n_threads: int | None = None
+        Number of threads for batched fits (default: all available CPUs).
+
     Notes
     -----
 
@@ -1021,7 +1077,15 @@ class BitBirch:
         branching_factor: int = 50,
         merge_criterion: str | MergeAcceptFunction | None = None,
         tolerance: float | None = None,
+        batch_size: int | None = None,
+        n_threads: int | None = None,
     ):
+        if batch_size is not None and batch_size < 1:
+            raise ValueError("batch_size must be >= 1")
+        if n_threads is not None and n_threads < 1:
+            raise ValueError("n_threads must be >= 1")
+        self.batch_size = batch_size
+        self.n_threads = n_threads
         # Criterion for merges
         self.threshold = threshold
         self.branching_factor = branching_factor
@@ -1062,6 +1126,10 @@ class BitBirch:
         # update the merge_accept function if the global set_merge() is called
         # (discouraged)
         _BITBIRCH_INSTANCES.add(self)
+
+    # Defaults for trees pickled by earlier versions
+    batch_size: int | None = None
+    n_threads: int | None = None
 
     @property
     def merge_criterion(self) -> str:
@@ -1205,6 +1273,10 @@ class BitBirch:
         if self._only_has_leaves:
             raise ValueError("Internal nodes were released, call reset() before fit()")
         params = self._fit_params()
+        if self.batch_size is not None:
+            return self._fit_batched(
+                X, n_features, input_is_packed, reinsert_indices, weights, params
+            )
         if self._tree is None:
             cpp = (
                 _CppTree.supports(params, n_features)
@@ -1222,6 +1294,53 @@ class BitBirch:
             start=self.num_fitted_fps,
             count=self._count_fitted,
         )
+        return self
+
+    def _fit_batched(
+        self,
+        X: _Input,
+        n_features: int,
+        input_is_packed: bool,
+        reinsert_indices: tp.Iterable[int] | None,
+        weights: tp.Iterable[int] | None,
+        params: _FitParams,
+    ) -> tpx.Self:
+        # fit() with the batched algorithm (nvMolKit's), into a new C++ tree
+        if self._tree is not None:
+            raise ValueError(
+                "A batched fit builds a new tree: call reset() first, or set"
+                " batch_size = None to insert into the existing tree serially"
+            )
+        if _cpp_bitbirch is None:
+            raise ValueError(
+                "Batched fits require the C++ BitBirch tree (build bblean with"
+                " BITBIRCH_BUILD_CPP=1, and don't set BITBIRCH_NO_CPP_TREE)"
+            )
+        if weights is not None:
+            raise ValueError("Batched fits do not support weights")
+        merge = _cpp_merge_params(params.merge_accept_fn, params.threshold)
+        if merge is None or merge[0] != "diameter":
+            raise ValueError(
+                "Batched fits only support the 'diameter' merge criterion,"
+                f" got {params.merge_accept_fn!r}"
+            )
+        if params.branching_factor < 3:
+            raise ValueError("Batched fits require branching_factor >= 3")
+        if n_features % 8 != 0:
+            raise ValueError("Batched fits require n_features to be a multiple of 8")
+        tree = _CppTree(n_features)
+        num = tree.fit_batched(
+            X,
+            n_features,
+            input_is_packed,
+            reinsert_indices,
+            params,
+            self.num_fitted_fps,
+            self.batch_size,  # type: ignore
+            self.n_threads if self.n_threads is not None else _num_avail_cpus(),
+        )
+        self._tree = tree
+        self._count_fitted(num, False)
         return self
 
     def _fit_buffers(
@@ -1713,6 +1832,8 @@ class BitBirch:
         ]
         if self.tolerance is not None:
             parts.append(f"tolerance={self.tolerance}")
+        if self.batch_size is not None:
+            parts.append(f"batch_size={self.batch_size}")
         return f"{self.__class__.__name__}({', '.join(parts)})"
 
     def save(self, path: Path | str) -> None:

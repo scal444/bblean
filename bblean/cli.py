@@ -1259,6 +1259,25 @@ def _run(
             help="Copy the input files instead of symlink",
         ),
     ] = False,
+    batch_size: Annotated[
+        int | None,
+        Option(
+            "--batch-size",
+            rich_help_panel="Advanced",
+            help="Cluster with the multithreaded *batched* BitBIRCH algorithm"
+            " (the algorithm of nvMolKit's GPU BitBIRCH, same clusters) using this"
+            " batch size, instead of the serial algorithm. Requires the C++"
+            " extensions and '--set-merge diameter'. Refinement rounds are serial",
+        ),
+    ] = None,
+    threads: Annotated[
+        int | None,
+        Option(
+            "--threads",
+            rich_help_panel="Advanced",
+            help="Num. threads for --batch-size (default: all available CPUs)",
+        ),
+    ] = None,
     verbose: Annotated[
         bool,
         Option("-v/-V", "--verbose/--no-verbose"),
@@ -1272,6 +1291,10 @@ def _run(
     console = get_console(silent=not verbose)
     if variant == "int64" and input_is_packed:
         raise ValueError("Packed inputs are not supported for the int64 variant")
+    if variant != "lean" and (batch_size is not None or threads is not None):
+        raise ValueError("--batch-size and --threads require the 'lean' variant")
+    if threads is not None and batch_size is None:
+        raise ValueError("--threads is only used together with --batch-size")
     if refine_rounds is None:
         refine_rounds = 1 if refine_num > 0 else 0
     if refine_rounds > 0 and refine_num == 0:
@@ -1331,9 +1354,27 @@ def _run(
             threshold=threshold,
             merge_criterion=merge_criterion,
             tolerance=tolerance,
+            batch_size=batch_size,
+            n_threads=threads,
         )
     with console.status("[italic]BitBirching...[/italic]", spinner="dots"):
-        for file in input_files:
+        if batch_size is not None:
+            # A batched fit processes all fingerprints at once
+            if len(input_files) == 1:
+                batched_input: tp.Any = input_files[0]
+            else:
+                batched_input = np.concatenate(
+                    [np.load(f, mmap_mode="r")[:max_fps] for f in input_files]
+                )
+            tree.fit(
+                batched_input,
+                n_features=n_features,
+                input_is_packed=input_is_packed,
+                max_fps=max_fps if len(input_files) == 1 else None,
+            )
+            # Refinement (if any) reinserts serially
+            tree.batch_size = None
+        for file in input_files if batch_size is None else []:
             # Fitting a file uses mmap internally, and releases memory in a smart way
             tree.fit(
                 file,
