@@ -65,6 +65,7 @@ from numpy.typing import NDArray, DTypeLike
 from bblean._memory import _mmap_file_and_madvise_sequential, _ArrayMemPagesManager
 from bblean.merges import (
     MergeAcceptFunction,
+    _cpp_merge_params,
     _get_merge_accept_fn,
     _BUILTIN_MERGES,
     DiscardSubcluster,
@@ -93,7 +94,23 @@ else:
     except ImportError:
         from bblean.fingerprints import unpack_fingerprints as _unpack_fingerprints
 
+# C++ version of the BitBirch tree, used when available (same results as the python
+# tree), unless BITBIRCH_NO_CPP_TREE is set
+_cpp_bitbirch: tp.Any
+if _env_var_is_on("BITBIRCH_NO_EXTENSIONS") or _env_var_is_on("BITBIRCH_NO_CPP_TREE"):
+    _cpp_bitbirch = None
+else:
+    try:
+        from bblean import _cpp_bitbirch  # type: ignore
+    except ImportError:
+        _cpp_bitbirch = None
+
 __all__ = ["BitBirch"]
+
+# Rows per call to the C++ tree when fitting arrays that are not mmapped files, which
+# bounds the size of the temporary packed copies of unpacked fingerprints
+_CPP_FIT_CHUNK = 65536
+_NO_CPP_TREE_HINT = "set BITBIRCH_NO_CPP_TREE=1 to use the python tree"
 
 
 @tp.overload
@@ -759,6 +776,178 @@ class _PyTree:
         return assignments
 
 
+class _CppTree:
+    r"""BitBirch tree of the C++ extension ``bblean._cpp_bitbirch``
+
+    It builds the same tree as `_PyTree`, for the builtin merge criteria and dense
+    binary fingerprints with a number of features that is a multiple of 8.
+    """
+
+    def __init__(self, n_features: int) -> None:
+        self._tree = _cpp_bitbirch.Tree(n_features)
+
+    @staticmethod
+    def supports(params: _FitParams, n_features: int) -> bool:
+        return (
+            _cpp_bitbirch is not None
+            and n_features % 8 == 0
+            and _cpp_merge_params(params.merge_accept_fn, params.threshold) is not None
+        )
+
+    @property
+    def n_features(self) -> int:
+        return self._tree.n_features
+
+    @property
+    def only_leaves(self) -> bool:
+        return self._tree.only_leaves
+
+    def _merge_params(
+        self, n_features: int, params: _FitParams
+    ) -> tuple[str, float, float, float, float]:
+        # Merge parameters for a fit
+        if self.n_features != n_features:
+            raise ValueError(
+                f"n_features ({n_features}) is different from the number of features"
+                f" of the fitted tree ({self.n_features})"
+            )
+        merge = _cpp_merge_params(params.merge_accept_fn, params.threshold)
+        if merge is None:
+            raise ValueError(
+                f"Merge criterion {params.merge_accept_fn!r} is not supported by"
+                " the C++ BitBirch tree, which was used for the previous fits,"
+                f" {_NO_CPP_TREE_HINT}"
+            )
+        return merge
+
+    def fit(
+        self,
+        X: _Input,
+        n_features: int,
+        input_is_packed: bool,
+        reinsert_indices: tp.Iterable[int] | None,
+        weights: tp.Iterable[int] | None,
+        mmanager: _ArrayMemPagesManager,
+        params: _FitParams,
+        start: int,
+        count: _FitCount,
+    ) -> None:
+        merge = self._merge_params(n_features, params)
+        packed_rows = _cpp_packed_rows(X, input_is_packed, n_features)
+        if packed_rows is None:
+            raise ValueError(
+                "The C++ BitBirch tree requires packed uint8 or binary (0 / 1)"
+                f" unpacked fingerprints, {_NO_CPP_TREE_HINT}"
+            )
+        num = len(X)
+        ids = None
+        if reinsert_indices is not None:
+            ids = np.fromiter(
+                itertools.islice(reinsert_indices, num), dtype=np.int64, count=-1
+            )
+            num = len(ids)
+        w = None
+        if weights is not None:
+            w = np.fromiter(itertools.islice(weights, num), dtype=np.uint64, count=-1)
+            if len(w) < num:
+                raise ValueError("There are fewer weights than fingerprints")
+        # Fit in chunks of one 'page' of the memory manager, to release memory
+        # of mmapped files in the same way as the python tree
+        chunk = mmanager._iters_per_pagex if mmanager.can_release else _CPP_FIT_CHUNK
+        for begin in range(0, num, chunk):
+            end = min(begin + chunk, num)
+            self._tree.fit_packed(
+                packed_rows(begin, end),
+                None if ids is None else ids[begin:end],
+                start + begin,
+                None if w is None else w[begin:end],
+                merge,
+                params.branching_factor,
+            )
+            count(end - begin, False)
+            if mmanager.can_release and end % chunk == 0:
+                mmanager.release_curr_page_and_update_addr()
+
+    def fit_buffers(
+        self,
+        X: _Input,
+        n_features: int,
+        reinsert_index_seqs: tp.Iterable[tp.Sequence[int]] | None,
+        check_indices: bool,
+        mmanager: _ArrayMemPagesManager,
+        params: _FitParams,
+        count: _FitCount,
+    ) -> None:
+        merge = self._merge_params(n_features, params)
+        num = len(X)
+        offsets = idx = None
+        if reinsert_index_seqs is not None:
+            seqs = list(itertools.islice(reinsert_index_seqs, num))
+            num = len(seqs)
+            offsets = np.zeros(num + 1, dtype=np.int64)
+            np.cumsum([len(q) for q in seqs], out=offsets[1:])
+            idx = np.fromiter(
+                itertools.chain.from_iterable(seqs),
+                dtype=np.int64,
+                count=int(offsets[-1]),
+            )
+            del seqs
+        chunk = _CPP_FIT_CHUNK
+        for begin in range(0, num, chunk):
+            end = min(num, begin + chunk)
+            if isinstance(X, list):
+                bufs = np.stack(X[begin:end])
+            else:
+                bufs = np.ascontiguousarray(X[begin:end])
+            if offsets is None:
+                self._tree.fit_buffers(bufs, None, None, merge, params.branching_factor)
+                continue
+            offs = offsets[begin : end + 1]
+            if check_indices:
+                lens = np.diff(offs)
+                nonempty = lens > 0
+                if (bufs[nonempty, -1].astype(np.uint64) != lens[nonempty]).any():
+                    raise ValueError(
+                        "len mol_indices must be equal to buffer[-1] if specified"
+                    )
+            idx = tp.cast(NDArray[np.int64], idx)
+            self._tree.fit_buffers(
+                bufs,
+                idx[offs[0] : offs[-1]],
+                offs - offs[0],
+                merge,
+                params.branching_factor,
+            )
+            count(int(offs[-1] - offs[0]), False)
+
+    def release_internal(self) -> None:
+        self._tree.release_internal()
+
+    def leaf_bfs(self, sort: bool = True) -> list[_BFSubcluster]:
+        # Copies of the C++ leaf subclusters, as python objects
+        t = self._tree
+        return [
+            _BFSubcluster(buf, ids, cent, check_indices=False)
+            for buf, ids, cent in zip(
+                t.leaf_buffers(sort), t.cluster_mol_ids(sort), t.centroids(sort)
+            )
+        ]
+
+    def cluster_mol_ids(self, sort: bool = True) -> list[list[int]]:
+        return self._tree.cluster_mol_ids(sort)
+
+    def centroids(
+        self, sort: bool = True, packed: bool = True
+    ) -> list[NDArray[np.uint8]]:
+        cents = self._tree.centroids(sort)
+        if not packed:
+            cents = _unpack_fingerprints(cents, self.n_features)
+        return list(cents)
+
+    def assignments(self, n_mols: int, sort: bool = True) -> NDArray[np.uint64]:
+        return self._tree.assignments(n_mols, sort)
+
+
 class BitBirch:
     r"""Implements the BitBIRCH clustering algorithm, 'Lean' version
 
@@ -798,6 +987,12 @@ class BitBirch:
 
     tolerance: float
         Penalty value for similarity threshold of the 'tolerance' merge criteria.
+
+    The tree is kept by the C++ extension ``bblean._cpp_bitbirch`` when it is
+    available, for the builtin merge criteria and dense fingerprints with a number
+    of features that is a multiple of 8, and in python otherwise. Both give exactly
+    the same clusters. Set the environment variable ``BITBIRCH_NO_CPP_TREE=1`` to
+    always use the python tree.
 
     Notes
     -----
@@ -854,7 +1049,7 @@ class BitBirch:
 
         # Tree state
         self._num_fitted_fps = 0
-        self._tree: _PyTree | None = None
+        self._tree: _PyTree | _CppTree | None = None
         # TODO: Type correctly
         self._global_clustering_centroid_labels: NDArray[np.int64] | None = None
         self._n_global_clusters = 0
@@ -890,14 +1085,14 @@ class BitBirch:
         return self._tree is not None
 
     @property
-    def _fitted_tree(self) -> _PyTree:
+    def _fitted_tree(self) -> _PyTree | _CppTree:
         if self._tree is None:
             raise ValueError("The model has not been fitted yet.")
         return self._tree
 
     def __setstate__(self, state: dict[str, tp.Any]) -> None:
         if "_tree" not in state:
-            # Pickled before the tree was moved to _PyTree, with the tree in _root and
+            # Pickled before the C++ tree was added, with the python tree in _root and
             # _dummy_leaf
             root = state.pop("_root")
             dummy_leaf = state.pop("_dummy_leaf")
@@ -912,6 +1107,11 @@ class BitBirch:
 
     def _fit_params(self) -> _FitParams:
         return _FitParams(self._merge_accept_fn, self.threshold, self.branching_factor)
+
+    def _new_tree(self, n_features: int, cpp: bool) -> _PyTree | _CppTree:
+        if cpp:
+            return _CppTree(n_features)
+        return _PyTree(self.branching_factor, n_features)
 
     def _count_fitted(self, num: int, discarded: bool) -> None:
         self._num_fitted_fps += num
@@ -1003,7 +1203,11 @@ class BitBirch:
             raise ValueError("Internal nodes were released, call reset() before fit()")
         params = self._fit_params()
         if self._tree is None:
-            self._tree = _PyTree(self.branching_factor, n_features)
+            cpp = (
+                _CppTree.supports(params, n_features)
+                and _cpp_packed_rows(X, input_is_packed, n_features) is not None
+            )
+            self._tree = self._new_tree(n_features, cpp)
         self._tree.fit(
             X,
             n_features,
@@ -1059,7 +1263,9 @@ class BitBirch:
             raise ValueError("Internal nodes were released, call reset() before fit()")
         params = self._fit_params()
         if self._tree is None:
-            self._tree = _PyTree(self.branching_factor, n_features)
+            self._tree = self._new_tree(
+                n_features, _CppTree.supports(params, n_features)
+            )
         self._tree.fit_buffers(
             X,
             n_features,
@@ -1611,6 +1817,50 @@ class BitBirch:
         # This is the bottleneck for building this index
         # K-means is feasible, agglomerative is extremely expensive
         return predictor.fit_predict(centrals) + 1
+
+
+def _cpp_packed_rows(
+    X: tp.Any, input_is_packed: bool, n_features: int
+) -> tp.Callable[[int, int], NDArray[np.uint8]] | None:
+    # Function that returns X[begin:end] as contiguous packed uint8 fingerprints for
+    # the C++ tree, or None if it does not support X (only dense packed uint8 or binary
+    # unpacked fingerprints, with a number of features that is a multiple of 8)
+    if _cpp_bitbirch is None or n_features % 8 != 0:
+        return None
+    if isinstance(X, list):
+        arrays = X
+        if not all(isinstance(a, np.ndarray) and a.ndim == 1 for a in X):
+            return None
+        if len({a.shape for a in X}) > 1:
+            return None
+    elif isinstance(X, np.ndarray) and X.ndim == 2:
+        arrays = [X]
+    else:
+        return None
+    if input_is_packed:
+        if any(a.dtype != np.uint8 for a in arrays):
+            return None
+    # The python tree adds the unpacked values to the linear sums, the C++ tree only
+    # supports 0 / 1
+    elif not all(_is_binary(a) for a in arrays):
+        return None
+
+    def packed_rows(begin: int, end: int) -> NDArray[np.uint8]:
+        rows = np.stack(X[begin:end]) if isinstance(X, list) else X[begin:end]
+        if input_is_packed:
+            return np.ascontiguousarray(rows[:, : n_features // 8])
+        return pack_fingerprints(rows.astype(np.uint8, copy=False))
+
+    return packed_rows
+
+
+def _is_binary(a: NDArray[tp.Any]) -> bool:
+    # Whether all values of a are 0 or 1, without temporaries the size of a
+    if a.dtype.kind == "b":
+        return True
+    if a.dtype.kind not in "ui":
+        return False
+    return a.size == 0 or (a.max() <= 1 and (a.dtype.kind == "u" or a.min() >= 0))
 
 
 # There are 4 cases here:

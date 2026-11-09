@@ -7,7 +7,8 @@ only the public API, and the stored result is the full cluster membership in the
 tree's leaf order (``get_cluster_mol_ids(sort=False)``), which determines the
 clusters, their order, and the order of the molecules inside them. It is stored as a
 sha256 of the concatenated molecule ids and the cluster offsets (int64, little endian),
-with the number of clusters and of fitted fingerprints.
+with the number of clusters and of fitted fingerprints. The script always uses the
+python tree.
 """
 
 import hashlib
@@ -18,6 +19,7 @@ import typing as tp
 
 import numpy as np
 
+import bblean.bitbirch
 from bblean.bitbirch import BitBirch
 from bblean.fingerprints import make_fake_fingerprints, unpack_fingerprints
 from bblean.merges import (
@@ -155,6 +157,9 @@ def _cases() -> dict[str, tp.Callable[[], BitBirch]]:
 
 CASES = _cases()
 
+# Cases with user defined merge criteria, which always use the python tree
+PYTHON_ONLY = {"python-hook-merge", "python-discard-merge"}
+
 
 def summary(tree: BitBirch) -> dict[str, tp.Any]:
     r"""Number of clusters, number of fitted fingerprints, and a sha256 of the molecule
@@ -167,6 +172,8 @@ def summary(tree: BitBirch) -> dict[str, tp.Any]:
 
 
 if __name__ == "__main__":
+    # The reference results are those of the python tree
+    bblean.bitbirch._cpp_bitbirch = None
     out = {name: summary(make()) for name, make in CASES.items()}
     with open(sys.argv[1], "w") as f:
         json.dump(out, f, indent=1, sort_keys=True)
